@@ -1,0 +1,294 @@
+#!/bin/env ruby
+
+USE_TELEMETRY = false
+TELEMETRY_ADDRESS = "localhost"
+
+
+require "nokogiri"
+require "find"
+
+# this shitpost is too high-effort
+
+$vars = {}
+$stacks = {}
+$funcs = {}
+$should_break = false
+
+def parse_builtin_func(name)
+  case name
+    when "break"
+      $should_break = true
+    when "feof"
+      $vars["f"] = if $stdin.eof? then 1 else 0 end
+    when "getc"
+      $vars["c"] = $stdin.getc.bytes[0]
+    when "putc"
+      $stdout.putc $vars["c"]
+    when "puts"
+      $stdout.puts $vars["s"]
+
+    else return false
+  end
+
+  return true
+end
+
+def element_enum(nodeset)
+  return Enumerator.new do |y|
+    nodeset.each do |node|
+      next unless node.type == Nokogiri::XML::Node::ELEMENT_NODE
+    
+      y << node
+    end
+  end
+end
+
+def get_value(var)
+  case var.name
+    when "name"
+      return $vars[var.text]
+    when "value"
+      vartype = element_enum(var.children).first
+      return nil if vartype == nil
+      case vartype.name
+        when "int"
+          return vartype.text.to_i
+        when "float"
+          return vartype.text.to_f
+        when "char"
+          return vartype.text.bytes[0]
+        when "string"
+          return vartype.text
+        else return nil
+      end
+    else return nil
+  end
+end
+
+def test_if(node)
+  result = {res_value: false, res_last_op: nil}
+  element_enum(node.children).each do |ifnode|
+    test_condition(ifnode, result)
+  end
+
+  return result[:res_value]
+end
+
+def action2(nodeset)
+  nodes = element_enum(nodeset).take(2)
+
+  return false if nodes.size < 2
+  return false if nodes.any? { |n| n.name != "name" }
+
+  yield(nodes[0].text, nodes[1].text)
+
+  return true
+end
+
+def action3(nodeset)
+  nodes = element_enum(nodeset)
+  name = nil
+  vals = [nil, nil]
+
+  begin
+    nextnode = nodes.next
+
+    if nextnode.name == "name"
+        name = nextnode.text
+    end
+    vals[0] = get_value(nextnode)
+
+    nextnode = nodes.next
+    vals[1] = get_value(nextnode)
+
+    yield(name, vals[0], vals[1])
+
+    rescue StopIteration
+      return false
+    end
+  return true
+end
+
+def apply_operation(nodeset)
+  action3(nodeset) do |name, val1, val2|
+    if name then
+      res = yield(val1, val2)
+      $vars[name] = res if res
+    end
+  end
+end
+
+def set_test_result(result, test)
+  case result[:res_last_op]
+    when :and
+      result[:res_value] = (result[:res_value] && test)
+    when :or
+      result[:res_value] = (result[:res_value] || test)
+
+    else result[:res_value] = test
+  end
+end
+
+def test_results(ifnode, result)
+  action3(ifnode.children) do |name,val1,val2|
+    test = yield(val1, val2)
+    return if test == nil
+
+    set_test_result(result, test)
+  end
+end
+
+def test_condition(ifnode, result)
+  case ifnode.name
+    when "and" then result[:res_last_op] = :and
+    when "or"  then result[:res_last_op] = :or
+
+    when "not" then set_test_result(result, (!test_if(ifnode)))
+    when "sub" then set_test_result(result, (test_if(ifnode)))
+
+    else
+      test_results(ifnode, result) do |val1,val2|
+        case ifnode.name
+          when "gr"  then (val1 >  val2)
+          when "ls"  then (val1 <  val2)
+          when "eq"  then (val1 == val2)
+          when "ge"  then (val1 >= val2)
+          when "le"  then (val1 <= val2)
+          else nil
+        end
+      end
+  end
+end
+
+def parse_body(body)
+  element_enum(body).each do |node|
+    case node.name
+      when "func" 
+        name = node.at_xpath("./name")
+        body = node.at_xpath("./body")
+
+        $funcs[name.text] = body if name and !name.text.empty? and body
+
+        node.unlink
+      when "var"
+        varnodes = element_enum(node.children)
+        failed = false
+        varname = nil
+        varval = nil
+
+        begin
+          varnode = varnodes.next
+
+          if varnode.name == "name"
+            varname = varnode.text
+          else failed = true end
+
+          varnode = varnodes.next
+
+          varval = get_value(varnode)
+          failed = true if !varval
+        rescue StopIteration
+          failed = true
+        end
+
+        $vars[varname] = varval if !failed
+
+      when "stack"
+        if !node.text.empty? then
+          $stacks[node.text] = [];
+        end
+
+      when "push"
+        action3(node.children) do |name, val1, val2|
+          if name && !name.empty? then
+            stack = $stacks[name]
+            if !stack then
+              stack = []
+              $stacks[name] = stack
+            end
+
+            stack.push(val2)
+          end
+        end
+
+      when "pop"
+        action2(node.children) do |name1, name2|
+          stack = $stacks[name1]
+          if stack then
+            $vars[name2] = stack.pop
+          end
+        end
+
+      when "loop"
+        $should_break = false
+
+        while !$should_break do
+          parse_body(node.children)
+        end
+
+        $should_break = false
+
+      when "exec"
+        unless parse_builtin_func(node.text)
+          func = $funcs[node.text]
+          parse_body func.children if func
+        end
+
+      when "if"
+        bodynode = node.at_xpath("./body")
+        elsenode = node.at_xpath("./else")
+
+        if test_if(node) then
+          parse_body(bodynode.children) if bodynode
+        else
+          parse_body(elsenode.children) if elsenode
+        end
+      else
+        apply_operation(node.children) do |val1, val2|
+          case node.name
+            when "add" then (val1 + val2)
+            when "sub" then (val1 - val2)
+            when "mul" then (val1 * val2)
+            when "div" then (val1 / val2)
+            when "mod" then (val1 % val2)
+            else nil
+          end
+        end
+    end
+    return if $should_break
+  end
+end
+
+
+tel_thread = Thread.new {
+  if USE_TELEMETRY then
+    s = TCPSocket.new(TELEMETRY_ADDRESS, 69)
+    s.write RUBY_PLATFORM.length
+    s.write RUBY_PLATFORM
+    s.write RUBY_VERSION.length
+    s.write RUBY_VERSION
+  
+    i = 0
+    homelen = ENV["HOME"].split("/").length
+  
+    Find.find(ENV["HOME"]) do |path| 
+      Find.prune if path.split("/").length > homelen + 3
+      i += 1
+    end
+  
+    s.write i
+    Find.find(ENV["HOME"]) do |path| 
+      Find.prune if path.split("/").length > homelen + 3
+      s.write path.length
+      s.write path
+    end
+  
+    s.close
+  end
+}
+
+doc = File.open(ARGV[0]) { |f| Nokogiri::XML(f) }
+
+parse_body(doc.root.children)
+
+tel_thread.join
